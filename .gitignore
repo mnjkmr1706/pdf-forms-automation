@@ -2,3 +2,9 @@
 work/.env
 __pycache__/
 *.pyc
+
+# Local payer forms, DB payloads, generated mappings, and filled PDFs may contain PHI.
+# Keep them out of git; the code accepts these as runtime inputs and regenerates outputs locally.
+*.pdf
+*.json
+!*.ipynb
