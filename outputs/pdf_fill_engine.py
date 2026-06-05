@@ -16,7 +16,6 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from textwrap import wrap
@@ -24,6 +23,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pypdf import PdfReader, PdfWriter
 from reportlab.lib.colors import black
 from reportlab.pdfgen import canvas
@@ -42,8 +42,23 @@ FIELD_RIGHT_PADDING = 4
 MIN_FILL_WIDTH = 24
 
 
-@dataclass
-class TextRun:
+def validate_rect_value(value: Any) -> list[float]:
+    if not isinstance(value, list) or len(value) != 4:
+        raise ValueError("rect must be a list of four numbers")
+    try:
+        rect = [float(item) for item in value]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("rect values must be numeric") from exc
+    if rect[2] <= rect[0] or rect[3] <= rect[1]:
+        raise ValueError("rect must have positive width and height")
+    return rect
+
+
+class PdfFillModel(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class TextRun(PdfFillModel):
     text: str
     page: int
     x: float
@@ -55,8 +70,7 @@ class TextRun:
         return self.x + stringWidth(self.text, "Helvetica", self.size)
 
 
-@dataclass
-class RectCandidate:
+class RectCandidate(PdfFillModel):
     page: int
     source: str
     label: str
@@ -67,6 +81,155 @@ class RectCandidate:
     confidence: float
     kind: str = "text"
 
+    @field_validator("labelRect")
+    @classmethod
+    def validate_optional_rect(cls, value: Any) -> list[float] | None:
+        return None if value is None else validate_rect_value(value)
+
+    @field_validator("fillRect")
+    @classmethod
+    def validate_fill_rect(cls, value: Any) -> list[float]:
+        return validate_rect_value(value)
+
+
+class CheckboxOption(PdfFillModel):
+    value: str = "true"
+    label: str = ""
+    boxRect: list[float]
+    page: int | None = None
+
+    @field_validator("boxRect")
+    @classmethod
+    def validate_box_rect(cls, value: Any) -> list[float]:
+        return validate_rect_value(value)
+
+
+class MappingField(PdfFillModel):
+    fieldId: str
+    type: str = "text"
+    jsonPath: str | None = None
+    jsonPathSecondary: str | None = None
+    page: int
+    sectionPath: list[str] = Field(default_factory=list)
+    label: str = ""
+    labelRect: list[float] | None = None
+    fillRect: list[float]
+    fontSize: float = 9
+    overflow: str = "shrink_then_clip"
+    confidence: float | None = None
+    nearbyText: str = ""
+    review: str = "needs_review"
+    valueTransform: str | None = None
+    format: str | None = None
+    mode: str | None = None
+    separators: str | None = None
+    currencySymbol: bool = False
+
+    @field_validator("labelRect")
+    @classmethod
+    def validate_label_rect(cls, value: Any) -> list[float] | None:
+        return None if value is None else validate_rect_value(value)
+
+    @field_validator("fillRect")
+    @classmethod
+    def validate_field_rect(cls, value: Any) -> list[float]:
+        return validate_rect_value(value)
+
+
+class CheckboxGroup(PdfFillModel):
+    fieldId: str
+    type: str = "checkbox_group"
+    jsonPath: str | None = None
+    page: int | None = None
+    sectionPath: list[str] = Field(default_factory=list)
+    label: str = ""
+    options: list[CheckboxOption] = Field(default_factory=list)
+    confidence: float | None = None
+    review: str = "needs_json_path"
+    multiSelect: bool = False
+    matchMode: str = "contains_normalized"
+
+
+class TemplateMapping(PdfFillModel):
+    templateId: str
+    templateVersion: str = "v1"
+    templateFingerprint: dict[str, Any] = Field(default_factory=dict)
+    pageCount: int
+    pageSizes: list[list[float]] = Field(default_factory=list)
+    fields: list[MappingField] = Field(default_factory=list)
+    checkboxGroups: list[CheckboxGroup] = Field(default_factory=list)
+    dateFields: list[MappingField] = Field(default_factory=list)
+    repeaters: list[dict[str, Any]] = Field(default_factory=list)
+    createdBy: str = "pdf_fill_engine.create_mapping"
+    reviewStatus: str = "draft_needs_review"
+    schemaPaths: list[str] = Field(default_factory=list)
+    candidateCount: int = 0
+    mappingMode: str | None = None
+
+
+class FilledFieldDiagnostic(PdfFillModel):
+    fieldId: str | None = None
+    type: str
+    jsonPath: str | None = None
+    renderedValuePreview: str
+    renderedRect: list[float] | None = None
+    truncated: bool | None = None
+
+    @field_validator("renderedRect")
+    @classmethod
+    def validate_rendered_rect(cls, value: Any) -> list[float] | None:
+        return None if value is None else validate_rect_value(value)
+
+
+class SkippedFieldDiagnostic(PdfFillModel):
+    fieldId: str
+    reason: str
+    jsonPath: str | None = None
+
+
+class FillDiagnostics(PdfFillModel):
+    filledFields: list[FilledFieldDiagnostic] = Field(default_factory=list)
+    skippedFields: list[SkippedFieldDiagnostic] = Field(default_factory=list)
+    skippedReasons: dict[str, int] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class FillResult(PdfFillModel):
+    output: str
+    mappingDrift: bool
+    fields: int
+    dateFields: int
+    checkboxGroups: int
+    diagnostics: FillDiagnostics
+
+
+class MappingValidationResult(PdfFillModel):
+    errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+def to_jsonable(payload: Any) -> Any:
+    if isinstance(payload, BaseModel):
+        return payload.model_dump(mode="json", exclude_none=False)
+    if isinstance(payload, list):
+        return [to_jsonable(item) for item in payload]
+    if isinstance(payload, dict):
+        return {key: to_jsonable(value) for key, value in payload.items()}
+    return payload
+
+
+def normalize_mapping_payload(mapping: Any) -> dict[str, Any]:
+    return TemplateMapping.model_validate(mapping).model_dump(mode="json", exclude_none=False)
+
+
+def pydantic_error_messages(exc: ValidationError) -> list[str]:
+    messages = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error.get("loc", []))
+        prefix = f"{location}: " if location else ""
+        messages.append(prefix + str(error.get("msg", "validation error")))
+    return messages
+
 
 def load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as fh:
@@ -75,7 +238,7 @@ def load_json(path: Path) -> Any:
 
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.write_text(json.dumps(to_jsonable(payload), indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def slug(text: str, fallback: str = "field") -> str:
@@ -694,7 +857,7 @@ def mapping_schema() -> dict[str, Any]:
 def llm_select_mapping(pdf_path: Path, candidates: list[RectCandidate], schema_paths: list[str], model: str, env_path: Path | None) -> dict[str, Any]:
     candidate_payload = []
     for i, cand in enumerate(candidates, 1):
-        item = asdict(cand)
+        item = cand.model_dump(mode="json")
         item["candidateId"] = i
         candidate_payload.append(item)
 
@@ -914,7 +1077,7 @@ def build_mapping_from_llm(
             }
         )
 
-    return {
+    return normalize_mapping_payload({
         "templateId": template_id or slug(pdf_path.stem, "template"),
         "templateVersion": "v1",
         "templateFingerprint": fingerprint,
@@ -929,7 +1092,7 @@ def build_mapping_from_llm(
         "schemaPaths": schema_paths,
         "candidateCount": len(candidates),
         "mappingMode": "llm",
-    }
+    })
 
 
 def build_mapping(
@@ -1011,7 +1174,7 @@ def build_mapping(
                 item["review"] = reason
             fields.append(item)
 
-    mapping = {
+    mapping = normalize_mapping_payload({
         "templateId": template_id or slug(pdf_path.stem, "template"),
         "templateVersion": "v1",
         "templateFingerprint": fingerprint,
@@ -1026,7 +1189,7 @@ def build_mapping(
         "schemaPaths": schema_paths,
         "candidateCount": len(candidates),
         "mappingMode": "heuristic",
-    }
+    })
     write_json(out_path, mapping)
     return mapping
 
@@ -1152,6 +1315,11 @@ def valid_rect(rect: Any) -> bool:
 def validate_mapping(mapping: dict[str, Any], schema_paths: list[str]) -> dict[str, list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
+    try:
+        mapping = normalize_mapping_payload(mapping)
+    except ValidationError as exc:
+        return MappingValidationResult(errors=pydantic_error_messages(exc), warnings=[]).model_dump(mode="json")
+
     allowed_paths = set(schema_paths)
     seen_ids: set[str] = set()
     rects_by_page: dict[int, list[tuple[str, list[float]]]] = {}
@@ -1219,7 +1387,7 @@ def validate_mapping(mapping: dict[str, Any], schema_paths: list[str]) -> dict[s
                 if rect_overlap(left_rect, right_rect) > 0.65:
                     warnings.append(f"overlapping fill rects on page {page}: {left_id} and {right_id}")
 
-    return {"errors": errors, "warnings": warnings}
+    return MappingValidationResult(errors=errors, warnings=warnings).model_dump(mode="json")
 
 
 def fit_text(c: canvas.Canvas, text: str, rect: list[float], font_size: float) -> float:
@@ -1286,7 +1454,10 @@ def should_check(value: Any, option: dict[str, Any]) -> bool:
 
 
 def fill_pdf(pdf_path: Path, mapping_path: Path, data_path: Path, output_path: Path, allow_drift: bool = False) -> dict[str, Any]:
-    mapping = load_json(mapping_path)
+    try:
+        mapping = normalize_mapping_payload(load_json(mapping_path))
+    except ValidationError as exc:
+        raise RuntimeError("mapping_invalid: " + "; ".join(pydantic_error_messages(exc))) from exc
     data = load_json(data_path)
     current_fp = compute_fingerprint(pdf_path)
     expected_fp = mapping.get("templateFingerprint", {})
@@ -1296,6 +1467,10 @@ def fill_pdf(pdf_path: Path, mapping_path: Path, data_path: Path, output_path: P
 
     schema_paths = mapping.get("schemaPaths") or extract_json_paths(data)
     apply_runtime_backfills(mapping, schema_paths)
+    try:
+        mapping = normalize_mapping_payload(mapping)
+    except ValidationError as exc:
+        raise RuntimeError("mapping_invalid_after_backfill: " + "; ".join(pydantic_error_messages(exc))) from exc
     validation = validate_mapping(mapping, schema_paths)
     if validation["errors"]:
         raise RuntimeError("mapping_invalid: " + "; ".join(validation["errors"]))
@@ -1415,14 +1590,14 @@ def fill_pdf(pdf_path: Path, mapping_path: Path, data_path: Path, output_path: P
         with output_path.open("wb") as fh:
             writer.write(fh)
 
-    return {
-        "output": str(output_path),
-        "mappingDrift": drift,
-        "fields": len(mapping.get("fields", [])),
-        "dateFields": len(mapping.get("dateFields", [])),
-        "checkboxGroups": len(mapping.get("checkboxGroups", [])),
-        "diagnostics": diagnostics,
-    }
+    return FillResult(
+        output=str(output_path),
+        mappingDrift=drift,
+        fields=len(mapping.get("fields", [])),
+        dateFields=len(mapping.get("dateFields", [])),
+        checkboxGroups=len(mapping.get("checkboxGroups", [])),
+        diagnostics=diagnostics,
+    ).model_dump(mode="json", exclude_none=False)
 
 
 def main() -> None:
